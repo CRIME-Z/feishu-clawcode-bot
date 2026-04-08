@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+.venv
+*.log
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Logs
+daemon*.log
+bot*.log
+watchdog*.log
+feishu_bot.log
+
+# Data (may contain sensitive info)
+data/
