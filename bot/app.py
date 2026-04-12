@@ -182,7 +182,7 @@ class FeishuBot:
         # ------------------------------------------------
         # V2: 初始化执行器
         # ------------------------------------------------
-        from clawcode_engine import FeishuClient as FeishuClientImpl
+        from feishu_client import FeishuClient as FeishuClientImpl
         from clawcode_engine import ClawCodeExecutorV2
 
         self.feishu_client = FeishuClientImpl()

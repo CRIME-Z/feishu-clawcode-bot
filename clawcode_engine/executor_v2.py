@@ -10,7 +10,7 @@ from typing import Optional
 
 from .acp_agent import ACPAgent
 from .queue_manager import QueueManager
-from ..feishu_client import FeishuClient
+from feishu_client import FeishuClient
 
 logger = logging.getLogger(__name__)
 

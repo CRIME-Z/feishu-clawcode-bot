@@ -99,11 +99,6 @@ class ACPAgent:
                 fl = fcntl.fcntl(fd, fcntl.F_GETFL)
                 fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
-                # 设置 stderr 合并到 stdout（CLI 输出到 stderr）
-                # 重定向 stderr -> stdout
-                import subprocess
-                # 实际上我们已经在 Popen 时分离了，重新用 tee 方式读取
-
                 self.running = True
 
                 # 启动看门狗
