@@ -1,6 +1,12 @@
 """
-Feishu + ClawCode Bot - 长连接模式
-使用 lark-oapi SDK 的 WebSocket 客户端
+Feishu + ClawCode Bot - V2 长连接模式
+整合架构：Flask/WebSocket + ACP Agent + Per-Session 队列 + 看门狗
+
+设计理念：
+- ACP 持久进程：session 管理在 Rust 端，更原生
+- Per-Session 并行：同一 session 串行，不同 session 并行
+- 看门狗：5分钟沉默自动重启
+- 模块化：clawcode_engine/ 负责所有执行逻辑
 """
 import os
 import sys
@@ -11,18 +17,23 @@ import threading
 import time
 import atexit
 
-# OpenClaw 风格去重模块
+# 路径处理
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# OpenClaw 风格去重模块
 import dedup
-from collections import defaultdict
 
 # 全局禁用 SSL 验证（如需代理访问外网）
 _orig_ssl_create_default_context = ssl.create_default_context
+
+
 def _patched_create_default_context(*args, **kwargs):
     ctx = _orig_ssl_create_default_context(*args, **kwargs)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
 ssl.create_default_context = _patched_create_default_context
 
 from dotenv import load_dotenv
@@ -38,55 +49,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class ClawCodeExecutor:
-    """ClawCode 执行器"""
+# =============================================================================
+# 去重模块
+# =============================================================================
 
-    def __init__(self, clawcode_path: str = ""):
-        self.clawcode_path = clawcode_path or os.getenv("CLAWCODE_PATH", "")
-        self.available = self._check_available()
-
-    def _check_available(self) -> bool:
-        if not self.clawcode_path:
-            return False
-        return os.path.exists(self.clawcode_path)
-
-    def is_available(self) -> bool:
-        return self.available
-
-    def execute(self, prompt: str, timeout: int = 120) -> str:
-        """执行 ClawCode 命令"""
-        if not self.is_available():
-            return "ClawCode 未配置"
-
-        import subprocess
-        try:
-            result = subprocess.run(
-                ["/usr/local/bin/python3", "-m", "clawcode", "-p", prompt, "-q"],
-                cwd=self.clawcode_path,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            return result.stdout or result.stderr or "无输出"
-        except subprocess.TimeoutExpired:
-            return "执行超时"
-        except Exception as e:
-            return f"执行失败: {str(e)}"
-
-
-def truncate(text: str, max_length: int = 2000) -> str:
-    """截断文本"""
-    if len(text) <= max_length:
-        return text
-    return text[:max_length] + f"\n\n[...还有 {len(text) - max_length} 字符]"
-
-
-# OpenClaw 风格去重：两层检查（内存 + 磁盘）+ 文件锁 + 原子写入
 _dedupe = None
+
 
 def _init_dedup():
     global _dedupe
-    dedup_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    dedup_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"
+    )
     _dedupe = dedup.PersistentDedupe(
         dedup_dir=dedup_dir,
         ttl_ms=1440 * 60 * 1000,  # 24小时
@@ -97,7 +71,25 @@ def _init_dedup():
     loaded = _dedupe.warmup()
     logger.info(f"[Dedup] 加载了 {loaded} 条去重记录，窗口 24h")
 
+
 _init_dedup()
+
+
+# =============================================================================
+# 辅助函数
+# =============================================================================
+
+
+def truncate(text: str, max_length: int = 4000) -> str:
+    """截断文本"""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + f"\n\n[...还有 {len(text) - max_length} 字符]"
+
+
+# =============================================================================
+# 事件处理器
+# =============================================================================
 
 
 def create_event_handler(bot_instance: "FeishuBot"):
@@ -137,16 +129,24 @@ def create_event_handler(bot_instance: "FeishuBot"):
 
                 logger.info(f"消息内容: {text[:100]}")
 
-                # 调用 ClawCode 处理
-                if bot_instance.clawcode.is_available():
-                    result = bot_instance.clawcode.execute(text, timeout=120)
-                    reply_text = truncate(result, 2000)
-                else:
-                    reply_text = "ClawCode 未配置，当前为演示模式"
+                # ------------------------------------------------
+                # V2: 消息加入 Per-Session 队列
+                # ------------------------------------------------
+                session_id = chat_id  # 以 chat_id 作为 session_id
 
-                # 发送回复
-                if chat_id:
-                    bot_instance.send_message(chat_id, reply_text)
+                if bot_instance.executor_v2.is_available():
+                    bot_instance.executor_v2.enqueue(
+                        session_id=session_id,
+                        chat_id=chat_id,
+                        text=text,
+                        msg_id=message_id
+                    )
+                else:
+                    # Executor 未启动，发送错误提示
+                    bot_instance.send_message(
+                        chat_id,
+                        "⚠️ ClawCode Agent 未运行，请联系管理员"
+                    )
 
         except Exception as e:
             logger.error(f"处理消息失败: {e}", exc_info=True)
@@ -159,19 +159,46 @@ def create_event_handler(bot_instance: "FeishuBot"):
     return handler
 
 
+# =============================================================================
+# Bot 主类
+# =============================================================================
+
+
 class FeishuBot:
-    """飞书 Bot (长连接模式)"""
+    """飞书 Bot (长连接模式 V2)"""
 
     def __init__(self):
         self.app_id = os.getenv("FEISHU_APP_ID", "")
         self.app_secret = os.getenv("FEISHU_APP_SECRET", "")
-        self.clawcode = ClawCodeExecutor()
+        self.agent_path = os.getenv("AGENT_PATH", "agent")
+        self.agent_env = {
+            "AGENT_CODE_API_KEY": os.getenv("AGENT_CODE_API_KEY", ""),
+            "AGENT_CODE_API_BASE_URL": os.getenv("AGENT_CODE_API_BASE_URL", ""),
+        }
 
         if not self.app_id or not self.app_secret:
             raise ValueError("FEISHU_APP_ID 和 FEISHU_APP_SECRET 必须配置")
 
+        # ------------------------------------------------
+        # V2: 初始化执行器
+        # ------------------------------------------------
+        from clawcode_engine import FeishuClient as FeishuClientImpl
+        from clawcode_engine import ClawCodeExecutorV2
+
+        self.feishu_client = FeishuClientImpl()
+        self.executor_v2 = ClawCodeExecutorV2(
+            config={
+                "agent_path": self.agent_path,
+                "working_dir": os.getcwd(),
+                "env": self.agent_env,
+                "watchdog_threshold": 300,
+                "feishu_client": self.feishu_client,
+            }
+        )
+
         # 创建 HTTP API client（用于发送消息）
         from lark_oapi.client import Client as HttpClient
+
         self.http_client = HttpClient.builder() \
             .app_id(self.app_id) \
             .app_secret(self.app_secret) \
@@ -193,7 +220,7 @@ class FeishuBot:
         )
 
     def send_message(self, chat_id: str, text: str) -> None:
-        """发送消息"""
+        """发送消息（通过 lark-oapi HTTP client）"""
         try:
             from lark_oapi.api.im.v1 import CreateMessageRequest
             from lark_oapi.api.im.v1.model import CreateMessageRequestBody
@@ -219,20 +246,50 @@ class FeishuBot:
         except Exception as e:
             logger.error(f"发送消息异常: {e}", exc_info=True)
 
+    def start(self):
+        """启动 Bot（包含执行器）"""
+        # 启动 ACP Agent
+        if not self.executor_v2.start():
+            logger.error("执行器启动失败，请检查 agent 是否安装")
+            return False
+
+        logger.info("执行器启动成功")
+        return True
+
+    def stop(self):
+        """停止 Bot"""
+        logger.info("正在停止 Bot...")
+        if self.executor_v2:
+            self.executor_v2.stop()
+
+
+# =============================================================================
+# 主函数
+# =============================================================================
+
 
 def main():
     """主函数"""
     print("=" * 50)
-    print("  Feishu + ClawCode Bot (长连接模式)")
+    print("  Feishu + ClawCode Bot V2 (长连接模式)")
+    print("  架构：ACP Agent + Per-Session 队列 + 看门狗")
     print("=" * 50)
     print(f"  App ID: {os.getenv('FEISHU_APP_ID', '未配置')}")
-    print(f"  ClawCode: {'✅ 已配置' if os.path.exists(os.getenv('CLAWCODE_PATH', '')) else '⚠️ 未配置'}")
-    print("=" * 50)
-    print("  使用 WebSocket 长连接模式")
-    print("  无需公网地址，直接连接飞书服务器")
+    print(f"  Agent: {os.getenv('AGENT_PATH', 'agent')}")
+    print(f"  API Key: {'✅ 已配置' if os.getenv('AGENT_CODE_API_KEY') else '⚠️ 未配置'}")
     print("=" * 50)
 
     bot = FeishuBot()
+
+    # 启动执行器
+    if not bot.start():
+        print("⚠️ 执行器启动失败，但继续启动 Bot...")
+    else:
+        print("✅ ACP Agent 已启动")
+
+    # 注册退出清理
+    atexit.register(bot.stop)
+
     client = bot.create_client()
 
     print("\n正在连接飞书服务器...")
@@ -249,11 +306,11 @@ def main():
     t.start()
 
     # 等待线程启动
-    import time
     time.sleep(2)
 
     if t.is_alive():
         print("✅ 客户端已在后台运行，等待消息...")
+        print("  (按 Ctrl+C 停止)")
         try:
             while t.is_alive():
                 time.sleep(1)
